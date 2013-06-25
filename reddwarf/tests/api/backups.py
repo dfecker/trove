@@ -33,6 +33,7 @@ from reddwarf.tests.api.instances import assert_unprocessable
 #from reddwarfclient import backups
 from reddwarfclient import exceptions
 from datetime import datetime
+import time
 # Define groups
 GROUP = "dbaas.api.backups"
 GROUP_POSITIVE = GROUP + ".positive"
@@ -43,6 +44,7 @@ BACKUP_DESC = 'test description for backup'
 BACKUP_DB_NAME = "backup_DB"
 backup_name = None
 backup_desc = None
+deleted_backup_id = None
 
 databases = []
 users = []
@@ -74,7 +76,7 @@ class BackupsBase(object):
     def _create_restore(self, client, backup_id):
         restorePoint = {"backupRef": backup_id}
         restore_resp = client.instances.create(
-            instance_info.name + "_restore",
+            BACKUP_NAME + "_restore",
             instance_info.dbaas_flavor_href,
             instance_info.volume,
             restorePoint=restorePoint)
@@ -138,18 +140,76 @@ class BackupsBase(object):
         return result.status == 'ACTIVE'
 
     def _verify_instance_status(self, instance_id, status):
+        time.sleep(1)
         result = instance_info.dbaas.instances.get(instance_id)
+        print("backups.py - _verify_instance_status: %r Time: %r" % (result.status, datetime.now()))
         return result.status == status
 
     def _verify_backup_status(self, backup_id, status):
+        print("sleep start "),
+        time.sleep(1000)
+        print("sleep finish ")
         result = instance_info.dbaas.backups.get(backup_id)
+        print("backups.py - _verify_backup_status: %r Time: %r" % (result.status, datetime.now()))
         return result.status == status
+
+    def _verify_backup_exists(self, result, backup_id):
+        assert_true(len(result) >= 1)
+        backup = None
+        for b in result:
+            if b.id == backup_id:
+                backup = b
+        assert_is_not_none(backup, "Backup not found")
+        return backup
 
     def _verify_databases(self, db_name):
         databases = instance_info.dbaas.databases.list(instance_info.id)
         dbs = [database.name for database in databases]
         for db in instance_info.databases:
             assert_true(db_name in dbs)
+
+    def _wait_for_active(self, client, id):
+        """ Waiting for 'ACTIVE' status """
+        self._wait_for_status(id, "ACTIVE")
+
+    def _wait_for_status(self,
+                         client,
+                         uuid,
+                         status,
+                         sleep_time=1,
+                         action=None):
+        """ Waiting for passed-in status
+        :rtype : status
+        :rtype : elapsed_time
+        @param dbaasClient:
+        @param uuid:
+        @param status:
+        @param sleep_time:
+        @param action:
+        """
+        print("Waiting for status %r on id: %r" % (status, uuid))
+        real_time = 0
+        elapsed = 0
+        start_time = time.time()
+        if not action:
+            action = "instance"
+        while elapsed < 600:
+            if action is "backup":
+                current_status = client.backups.get(uuid).status
+            else:
+                current_status = client.instances.get(uuid).status
+            print("Elapsed: %2.1f seconds, Status: %s" % (elapsed, current_status))
+            if current_status == status:
+                break
+            elif current_status == "ERROR" or current_status == "FAILED":
+                break
+            else:
+                while (time.time() - start_time) < elapsed + sleep_time:
+                    real_time = __import__("time")
+                    real_time.sleep(sleep_time)
+            elapsed = (time.time() - start_time)
+
+        return current_status, elapsed
 
 
 @test(depends_on_classes=[WaitForGuestInstallationToFinish],
@@ -178,23 +238,27 @@ class TestBackupPositive(BackupsBase):
         assert_is_not_none(result.created, 'backup.created does not exist')
         assert_is_not_none(result.updated, 'backup.updated does not exist')
         instance = instance_info.dbaas.instances.list()[0]
-        assert_equal(instance.status, 'BACKUP')
+        assert_true(instance.status in ('ACTIVE', 'BACKUP'))
         self.backup_id = result.id
+        self._wait_for_status(instance_info.dbaas, instance_info.id, 'BACKUP',
+                              sleep_time=2)
         # Get Backup status by backup id during and after backup creation
-        poll_until(lambda: self._verify_backup_status(result.id, 'NEW'),
-                   time_out=120, sleep_time=1)
-        poll_until(lambda: self._verify_instance_status(instance.id, 'BACKUP'),
-                   time_out=120, sleep_time=1)
-        poll_until(lambda: self._verify_backup_status(result.id, 'COMPLETED'),
-                   time_out=120, sleep_time=1)
-        poll_until(lambda: self._verify_instance_status(instance.id, 'ACTIVE'),
-                   time_out=120, sleep_time=1)
+        self._wait_for_status(instance_info.dbaas, self.backup_id, 'BUILDING',
+                              sleep_time=2, action='backup')
+        self._wait_for_status(instance_info.dbaas, self.backup_id, 'COMPLETED',
+                              sleep_time=2, action='backup')
+        self._wait_for_status(instance_info.dbaas, instance_info.id, 'ACTIVE',
+                              sleep_time=2)
 
     @test(runs_after=[test_create_backup])
     def test_list_backups(self):
         result = instance_info.dbaas.backups.list()
-        assert_equal(1, len(result))
-        backup = result[0]
+        for each in result:
+            print("ID: %r  Name: %r Status: %r" % (each.id,
+                                                   each.name,
+                                                   each.status))
+        backup = self._verify_backup_exists(result, self.backup_id)
+        assert_is_not_none(backup, "Backup not found")
         assert_equal(backup.name, BACKUP_NAME)
         assert_equal(backup.description, BACKUP_DESC)
         assert_equal(backup.instance_id, instance_info.id)
@@ -203,11 +267,10 @@ class TestBackupPositive(BackupsBase):
         assert_is_not_none(backup.created, 'backup.created does not exist')
         assert_is_not_none(backup.updated, 'backup.updated does not exist')
 
-    @test(runs_after=[test_create_backup])
+    @test(runs_after=[test_create_backup, test_list_backups])
     def test_list_backups_for_instance(self):
         result = self._list_backups_by_instance()
-        assert_equal(1, len(result))
-        backup = result[0]
+        backup = self._verify_backup_exists(result, self.backup_id)
         assert_equal(backup.name, BACKUP_NAME)
         assert_equal(backup.description, BACKUP_DESC)
         assert_equal(backup.instance_id, instance_info.id)
@@ -227,7 +290,7 @@ class TestBackupPositive(BackupsBase):
         assert_is_not_none(backup.created, 'backup.created does not exist')
         assert_is_not_none(backup.updated, 'backup.updated does not exist')
 
-    @test(runs_after=[test_create_backup])
+    @test(runs_after=[test_create_backup, test_list_backups_for_instance])
     def test_restore_backup(self):
         if test_config.auth_strategy == "fake":
             # We should create restore logic in fake guest agent to not skip
@@ -238,14 +301,17 @@ class TestBackupPositive(BackupsBase):
         assert_equal("BUILD", restore_resp.status)
         assert_is_not_none(restore_resp.id, 'restored inst_id does not exist')
         self.restore_id = restore_resp.id
-        poll_until(self._result_is_active)
+        #poll_until(self._result_is_active)
+        self._wait_for_status(instance_info.dbaas, self.restore_id, 'ACTIVE',
+                              sleep_time=2)
         restored_inst = instance_info.dbaas.instances.get(self.restore_id)
-        assert_equal(restored_inst.name, BACKUP_NAME)
+        assert_is_not_none(restored_inst, 'restored instance does not exist')
+        assert_equal(restored_inst.name, BACKUP_NAME + "_restore")
         assert_equal(restored_inst.status, 'ACTIVE')
         assert_is_not_none(restored_inst.id, 'restored inst_id does not exist')
         self._verify_databases(BACKUP_DB_NAME)
 
-    @test(runs_after=[test_list_backups, test_list_backups_for_instance],
+    @test(runs_after=[test_restore_backup, test_list_backups_for_instance],
           always_run=True)
     def test_delete_backup(self):
         self._delete_backup(self.backup_id)
@@ -259,22 +325,24 @@ class TestBackupPositive(BackupsBase):
         result = self._create_backup(self.restored_name,
                                      self.restored_desc,
                                      inst_id=self.restore_id)
-        assert_equal(200, instance_info.dbaas.last_http_code)
-        poll_until(lambda: self._verify_backup_status(result.id, 'COMPLETED'),
-                   time_out=120, sleep_time=1)
+        assert_equal(202, instance_info.dbaas.last_http_code)
+        #poll_until(lambda: self._verify_backup_status(result.id, 'COMPLETED'),
+        #           time_out=120, sleep_time=30)
+        self._wait_for_status(instance_info.dbaas, result.id, 'COMPLETED',
+                              sleep_time=2, action='backup')
+        self.deleted_backup_id = result.id
         instance_info.dbaas.instances.delete(self.restore_id)
         assert_equal(202, instance_info.dbaas.last_http_code)
         poll_until(lambda: self._instance_is_gone(self.restore_id))
         assert_raises(exceptions.NotFound, instance_info.dbaas.instances.get,
                       self.restore_id)
 
-    @test(runs_after=[test_delete_restored_instance])
+    @test(depends_on=[test_delete_restored_instance])
     def test_list_backups_for_deleted_instance(self):
         if test_config.auth_strategy == "fake":
             raise SkipTest("Skipping deleted instance tests for fake mode.")
         result = self._list_backups_by_instance(inst_id=self.restore_id)
-        assert_equal(1, len(result))
-        backup = result[0]
+        backup = self._verify_backup_exists(result, self.deleted_backup_id)
         assert_equal(backup.name, self.restored_name)
         assert_equal(backup.description, self.restored_desc)
         assert_equal(backup.instance_id, self.restore_id)
@@ -515,11 +583,11 @@ class TestBackupCleanup(BackupsBase):
     def test_clean_up_backups(self):
         results = instance_info.dbaas.backups.list()
         for backup in results:
-            poll_until(lambda: self._verify_backup_status(backup.id,
-                                                          'COMPLETED'))
-            try:
-                self._delete_backup(backup.id)
-                assert_equal(202, instance_info.dbaas.last_http_code)
-                poll_until(lambda: self._backup_is_gone(backup.id))
-            except exceptions.NotFound:
-                assert_equal(404, instance_info.dbaas.last_http_code)
+            print("Cleanup backup: %r and status: %r" % (backup.id, backup.status))
+            if backup.status is "COMPLETED":
+                try:
+                    self._delete_backup(backup.id)
+                    assert_equal(202, instance_info.dbaas.last_http_code)
+                    poll_until(lambda: self._backup_is_gone(backup.id))
+                except exceptions.NotFound:
+                    assert_equal(404, instance_info.dbaas.last_http_code)
