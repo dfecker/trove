@@ -38,6 +38,7 @@ import time
 GROUP = "dbaas.api.backups"
 GROUP_POSITIVE = GROUP + ".positive"
 GROUP_NEGATIVE = GROUP + ".negative"
+GROUP_CLEAN = GROUP + ".clean"
 # Define Globals
 BACKUP_NAME = 'backup_test'
 BACKUP_DESC = 'test description for backup'
@@ -250,7 +251,7 @@ class TestBackupPositive(BackupsBase):
         self._wait_for_status(instance_info.dbaas, instance_info.id, 'ACTIVE',
                               sleep_time=2)
 
-    @test(runs_after=[test_create_backup])
+    @test(depends_on=[test_create_backup])
     def test_list_backups(self):
         result = instance_info.dbaas.backups.list()
         for each in result:
@@ -267,7 +268,7 @@ class TestBackupPositive(BackupsBase):
         assert_is_not_none(backup.created, 'backup.created does not exist')
         assert_is_not_none(backup.updated, 'backup.updated does not exist')
 
-    @test(runs_after=[test_create_backup, test_list_backups])
+    @test(depends_on=[test_create_backup, test_list_backups])
     def test_list_backups_for_instance(self):
         result = self._list_backups_by_instance()
         backup = self._verify_backup_exists(result, self.backup_id)
@@ -279,7 +280,7 @@ class TestBackupPositive(BackupsBase):
         assert_is_not_none(backup.created, 'backup.created does not exist')
         assert_is_not_none(backup.updated, 'backup.updated does not exist')
 
-    @test(runs_after=[test_create_backup])
+    @test(depends_on=[test_create_backup])
     def test_get_backup(self):
         backup = instance_info.dbaas.backups.get(self.backup_id)
         assert_equal(backup.id, self.backup_id)
@@ -290,7 +291,7 @@ class TestBackupPositive(BackupsBase):
         assert_is_not_none(backup.created, 'backup.created does not exist')
         assert_is_not_none(backup.updated, 'backup.updated does not exist')
 
-    @test(runs_after=[test_create_backup, test_list_backups_for_instance])
+    @test(depends_on=[test_create_backup, test_list_backups_for_instance])
     def test_restore_backup(self):
         if test_config.auth_strategy == "fake":
             # We should create restore logic in fake guest agent to not skip
@@ -303,7 +304,7 @@ class TestBackupPositive(BackupsBase):
         self.restore_id = restore_resp.id
         #poll_until(self._result_is_active)
         self._wait_for_status(instance_info.dbaas, self.restore_id, 'ACTIVE',
-                              sleep_time=2)
+                              sleep_time=5)
         restored_inst = instance_info.dbaas.instances.get(self.restore_id)
         assert_is_not_none(restored_inst, 'restored instance does not exist')
         assert_equal(restored_inst.name, BACKUP_NAME + "_restore")
@@ -311,13 +312,13 @@ class TestBackupPositive(BackupsBase):
         assert_is_not_none(restored_inst.id, 'restored inst_id does not exist')
         self._verify_databases(BACKUP_DB_NAME)
 
-    @test(runs_after=[test_restore_backup, test_list_backups_for_instance],
+    @test(depends_on=[test_restore_backup, test_list_backups_for_instance],
           always_run=True)
     def test_delete_backup(self):
         self._delete_backup(self.backup_id)
         poll_until(self._backup_is_gone)
 
-    @test(runs_after=[test_restore_backup], always_run=True)
+    @test(depends_on=[test_restore_backup], always_run=True)
     def test_delete_restored_instance(self):
         if test_config.auth_strategy == "fake":
             raise SkipTest("Skipping delete restored instance for fake mode.")
@@ -372,10 +373,12 @@ class TestBackupNegative(BackupsBase):
         self.spare_client = util.create_dbaas_client(self.spare_user)
 
     def test_create_backup(self):
-        result = self._create_backup(BACKUP_NAME, BACKUP_DESC,
+        backup = self._create_backup(BACKUP_NAME, BACKUP_DESC,
                                      instance_info.id)
-        poll_until(lambda: self._verify_backup_status(result.id, 'COMPLETED'),
-                   time_out=120, sleep_time=1)
+        self._wait_for_status(instance_info.dbaas, backup.id, 'COMPLETED',
+                              sleep_time=2, action='backup')
+        #poll_until(lambda: self._verify_backup_status(result.id, 'COMPLETED'),
+        #           time_out=120, sleep_time=1)
 
     @test(runs_after=[test_create_backup])
     def test_create_backup_with_instance_not_active(self):
@@ -400,15 +403,19 @@ class TestBackupNegative(BackupsBase):
             assert_equal(422, instance_info.dbaas.last_http_code)
         assert_equal(422, instance_info.dbaas.last_http_code)
         # make sure the instance status goes back to "ACTIVE"
-        poll_until(lambda: self._verify_instance_status(self.xtra_instance.id,
-                                                        "ACTIVE"),
-                   time_out=120, sleep_time=1)
+        self._wait_for_status(instance_info.dbaas, self.xtra_instance.id,
+                              'ACTIVE', sleep_time=2)
+        #poll_until(lambda: self._verify_instance_status(self.xtra_instance.id,
+        #                                                "ACTIVE"),
+        #           time_out=120, sleep_time=1)
         # Now that it's active, create the backup
         self.xtra_backup = self._create_backup(BACKUP_NAME, BACKUP_DESC)
         assert_equal(202, instance_info.dbaas.last_http_code)
-        poll_until(lambda: self._verify_backup_status(self.xtra_backup.id,
-                                                      'COMPLETED'),
-                   time_out=120, sleep_time=1)
+        self._wait_for_status(instance_info.dbaas, self.xtra_backup.id,
+                              'COMPLETED', sleep_time=2, action='backup')
+        #poll_until(lambda: self._verify_backup_status(self.xtra_backup.id,
+        #                                              'COMPLETED'),
+        #           time_out=120, sleep_time=1)
         # DON'T Delete backup instance now, Need it for restore to smaller
 
     @test(runs_after=[test_create_backup_with_instance_not_active])
@@ -418,21 +425,24 @@ class TestBackupNegative(BackupsBase):
         # Create a 2GB instance and DB
 
         # Backup a 2GB Database
-        result = self._create_backup("2GB_backup", "restore backup to smaller")
+        backup = self._create_backup("2GB_backup", "restore backup to smaller")
         assert_equal(202, instance_info.dbaas.last_http_code)
-        backup_id = result.id
+        self._wait_for_status(instance_info.dbaas, backup.id,
+                              'COMPLETED', sleep_time=2, action='backup')
+        #poll_until(lambda: self._verify_backup_status(backup_id, 'COMPLETED'),
+        #           time_out=120, sleep_time=1)
         # Try to restore it to a 1GB instance
         try:
-            restore_result = self._create_new_restore(backup_id,
+            restore_result = self._create_new_restore(backup.id,
                                                       "1GB instance too small",
                                                       flavor=1,
                                                       volume=1)
         except exceptions.UnprocessableEntity:
             assert_equal(422, instance_info.dbaas.last_http_code)
         # Now delete the backup
-        self._delete_backup(backup_id)
+        self._delete_backup(backup.id)
         assert_equal(202, instance_info.dbaas.last_http_code)
-        poll_until(lambda: self._backup_is_gone(backup_id=backup_id))
+        poll_until(lambda: self._backup_is_gone(backup_id=backup.id))
 
     @test
     def test_list_backups_account_not_owned(self):
@@ -445,15 +455,23 @@ class TestBackupNegative(BackupsBase):
         # The SPARE user should not be able to "get" the STD user backups
         assert_equal(404, self.spare_client.last_http_code)
 
-    @test
+    @test(runs_after=[test_restore_backups_to_smaller_instance])
     def test_restore_backup_account_not_owned(self):
         if test_config.auth_strategy == "fake":
             raise SkipTest("Skipping restore tests for fake mode.")
-        result = self._create_backup("rest_not_owned_backup",
+        backup = self._create_backup("rest_not_owned_backup",
                                      "restoring a backup of a different user")
         assert_equal(202, instance_info.dbaas.last_http_code)
-        restore_result = self._create_restore(self.spare_client, result.id)
-        assert_equal(404, instance_info.dbaas.last_http_code)
+        self._wait_for_status(instance_info.dbaas, backup.id,
+                              'COMPLETED', sleep_time=2, action='backup')
+        #poll_until(lambda: self._verify_backup_status(backup_id, 'COMPLETED'),
+        #           time_out=120, sleep_time=1)
+        try:
+            restore_result = self._create_restore(self.spare_client, backup.id)
+        except exceptions.ClientException:
+            assert_equal(500, self.spare_client.last_http_code)
+        instance_info.dbaas.backups.delete(backup.id)
+        poll_until(lambda: self._backup_is_gone(backup_id=backup.id))
 
     @test
     def test_delete_backup_account_not_owned(self):
@@ -478,38 +496,56 @@ class TestBackupNegative(BackupsBase):
         assert_raises(exceptions.NotFound, instance_info.dbaas.backups.delete,
                       'nonexistent_backup')
 
-    @test
+    @test(runs_after=[test_restore_backup_account_not_owned])
     def test_restore_backup_that_did_not_complete(self):
         if test_config.auth_strategy == "fake":
             raise SkipTest("Skipping restore tests for fake mode.")
         # Backup a 10GB Database
-        result = self._create_backup("10GB_backup", "restore before complete")
-        backup_id = result.id
+        backup = self._create_backup("10GB_backup", "restore before complete")
         assert_equal(202, instance_info.dbaas.last_http_code)
         # restore immediately, before the backup is completed
-        restore_result = self._create_new_restore(backup_id,
-                                                  "backup did not complete",
-                                                  flavor=2,
-                                                  volume=10)
-        assert_equal(400, instance_info.dbaas.last_http_code)
+        try:
+            restore_result = self._create_new_restore(
+                backup.id, "backup did not complete", flavor=2, volume=10)
+        except exceptions.ClientException:
+            assert_equal(409, instance_info.dbaas.last_http_code)
+        self._wait_for_status(instance_info.dbaas, backup.id,
+                              'COMPLETED', sleep_time=2, action='backup')
+        #poll_until(lambda: self._verify_backup_status(backup_id, 'COMPLETED'),
+        #           time_out=120, sleep_time=1)
+        instance_info.dbaas.backups.delete(backup.id)
+        poll_until(lambda: self._backup_is_gone(backup_id=backup.id))
 
-    @test
+    @test(runs_after=[test_restore_backup_that_did_not_complete])
     def test_delete_while_backing_up(self):
-        result = self._create_backup("delete_as_backup",
+        backup = self._create_backup("delete_as_backup",
                                      "delete backup while backing up")
-        backup_id = result.id
         assert_equal(202, instance_info.dbaas.last_http_code)
         # Dont wait for backup to complete, try to delete it
         try:
-            self._delete_backup(backup_id)
+            self._delete_backup(backup.id)
         except:
             assert_equal(422, instance_info.dbaas.last_http_code)
+        self._wait_for_status(instance_info.dbaas, backup.id,
+                              'COMPLETED', sleep_time=2, action='backup')
+        #poll_until(lambda: self._verify_backup_status(backup_id, 'COMPLETED'),
+        #           time_out=120, sleep_time=1)
+        # DCF WHy is this delete different than the one above that uses the helper function?
+        instance_info.dbaas.backups.delete(backup.id)
+        poll_until(lambda: self._backup_is_gone(backup_id=backup.id))
 
     @test
     def test_instance_action_right_after_backup_create(self):
         """test any instance action while backup is running"""
+        backup = self._create_backup("modify_during_create",
+                                     "modify instance while creating backup")
+        assert_equal(202, instance_info.dbaas.last_http_code)
+        # Dont wait for backup to complete, try to delete it
         assert_unprocessable(instance_info.dbaas.instances.resize_instance,
                              instance_info.id, 1)
+        self._wait_for_status(instance_info.dbaas, backup.id,
+                              'COMPLETED', sleep_time=2, action='backup')
+
 
     @test
     def test_backup_create_another_backup_running(self):
@@ -529,32 +565,35 @@ class TestBackupNegative(BackupsBase):
     def test_restore_deleted_backup(self):
         if test_config.auth_strategy == "fake":
             raise SkipTest("Skipping restore tests for fake mode.")
-        result = self._create_backup("rest_del_backup",
+        backup = self._create_backup("rest_del_backup",
                                      "restoring a deleted backup")
-        backup_id = result.id
         assert_equal(202, instance_info.dbaas.last_http_code)
-        self._delete_backup(backup_id)
+        self._wait_for_status(instance_info.dbaas, backup.id,
+                              'COMPLETED', sleep_time=2, action='backup')
+        self._delete_backup(backup.id)
         poll_until(self._backup_is_gone)
-        restore_result = self._create_restore(instance_info.dbaas, backup_id)
-        assert_equal(400, instance_info.dbaas.last_http_code)
+        restore_result = self._create_restore(instance_info.dbaas, backup.id)
+        assert_equal(200, instance_info.dbaas.last_http_code)
         print dir(restore_result)
 
     @test
     def test_delete_deleted_backup(self):
-        result = self._create_backup("del_backup", "delete a deleted backup")
-        backup_id = result.id
+        backup = self._create_backup("del_backup", "delete a deleted backup")
         assert_equal(202, instance_info.dbaas.last_http_code)
-        poll_until(lambda: self._verify_backup_status(backup_id, 'COMPLETED'),
-                   time_out=120, sleep_time=1)
-        self._delete_backup(backup_id)
-        poll_until(lambda: self._backup_is_gone(backup_id))
+        self._wait_for_status(instance_info.dbaas, backup.id,
+                              'COMPLETED', sleep_time=2, action='backup')
+        #poll_until(lambda: self._verify_backup_status(backup_id, 'COMPLETED'),
+        #           time_out=120, sleep_time=1)
+        self._delete_backup(backup.id)
+        poll_until(lambda: self._backup_is_gone(backup.id))
         try:
-            self._delete_backup(backup_id)
+            self._delete_backup(backup.id)
         except exceptions.NotFound:
             assert_equal(404, instance_info.dbaas.last_http_code)
 
     @test(runs_after=[test_create_backup_with_instance_not_active,
-                      test_restore_backups_to_smaller_instance],
+                      test_restore_backups_to_smaller_instance,
+                      test_restore_deleted_backup],
           always_run=True)
     def test_delete_negative_instance(self):
         try:
@@ -577,16 +616,18 @@ class TestBackupNegative(BackupsBase):
 
 @test(depends_on_classes=[WaitForGuestInstallationToFinish],
       runs_after=[TestBackupPositive, TestBackupNegative],
-      groups=[GROUP, GROUP_NEGATIVE, GROUP_POSITIVE])
+      groups=[GROUP, GROUP_NEGATIVE, GROUP_POSITIVE, GROUP_CLEAN])
 class TestBackupCleanup(BackupsBase):
     @test(always_run=True)
     def test_clean_up_backups(self):
-        results = instance_info.dbaas.backups.list()
-        for backup in results:
+        backup_list = instance_info.dbaas.backups.list()
+        for backup in backup_list:
             print("Cleanup backup: %r and status: %r" % (backup.id, backup.status))
-            if backup.status is "COMPLETED":
+            if backup.status == 'COMPLETED':
                 try:
+                    print("Deleting it: %r" % backup.id)
                     self._delete_backup(backup.id)
+                    print("Deleted success")
                     assert_equal(202, instance_info.dbaas.last_http_code)
                     poll_until(lambda: self._backup_is_gone(backup.id))
                 except exceptions.NotFound:
