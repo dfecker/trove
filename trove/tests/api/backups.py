@@ -42,12 +42,21 @@ from trove.tests.api.instances import assert_unprocessable
 #from reddwarfclient import backups
 from troveclient import exceptions
 from datetime import datetime
+from time import sleep
+
+
+from trove.tests.util import mysql_connection
+from trove.tests.util import MySqlConnection
+from trove.tests.util import mysql as old_util
+
 # Define groups
 
 
 GROUP = "dbaas.api.backups"
 GROUP_POSITIVE = GROUP + ".positive"
 GROUP_NEGATIVE = GROUP + ".negative"
+GROUP_PERFORMANCE = GROUP + ".performance"
+GROUP_DELETE = GROUP + ".deleteAll"
 # Define Globals
 BACKUP_NAME = 'backup_test'
 BACKUP_DESC = 'test description for backup'
@@ -74,6 +83,7 @@ class BackupsBase(object):
         self.backup_id = None
         self.restore_id = None
         self.dbaas = util.create_dbaas_client(instance_info.user)
+        self.dbaas_admin = util.create_dbaas_client(instance_info.admin_user)
 
     def _create_backup(self, backup_name, backup_desc, inst_id=None):
         if inst_id is None:
@@ -520,7 +530,7 @@ class TestBackupNegative(BackupsBase):
         poll_until(lambda: self._verify_backup_status(backup.id, 'COMPLETED'),
                    time_out=120, sleep_time=2)
         self._delete_backup(backup.id)
-        poll_until(self._backup_is_gone(backup.id))
+        poll_until(lambda: self._backup_is_gone(backup.id))
         try:
             self._create_restore(instance_info.dbaas, backup.id)
             assert_true(False, "Expected 404 from create restore")
@@ -580,3 +590,214 @@ class TestBackupCleanup(BackupsBase):
                     poll_until(lambda: self._backup_is_gone(backup.id))
                 except exceptions.NotFound:
                     assert_equal(404, instance_info.dbaas.last_http_code)
+
+
+class TestMySqlConnection(MySqlConnection):
+
+    def create(self, ip, user_name, password):
+        from reddwarf.tests.util import mysql
+        connection = CONFIG.mysql_connection_method
+
+        return mysql.create_mysql_connection(ip, user_name, password)
+
+
+@test(groups=[GROUP_DELETE])
+class TestDeleteAll(BackupsBase):
+
+    @test
+    def test_delete_all(self):
+        util.delete_all_user_instances(self.dbaas)
+        # list the instances found for this user
+        #print 'List all instances found for this user'
+        #instancesList = self.dbaas.instances.list()
+        #for instance in instancesList:
+            # Add the instance to the list
+            #print("UUID: %s  STATUS: %s" % (instance.id, instance.status))
+            # Delete this instance
+
+            # wait for all the instances to go active
+
+
+@test(depends_on_classes=[WaitForGuestInstallationToFinish],
+      groups=[GROUP, GROUP_PERFORMANCE])
+class MySqlUtil(BackupsBase):
+
+    def __init__(self):
+        self.info = instance_info
+        inst = instance_info.dbaas.instances.get(instance_info.id)
+        mgmt_inst = instance_info.dbaas_admin.management.show(instance_info)
+        #print(dir(mgmt_inst.server))
+        #print(mgmt_inst.server['addresses']['usernet'][0]['addr'])
+        self.address = mgmt_inst.server['addresses']['usernet'][0]['addr']
+        self.user = "BackUtilTestUser"
+        self.password = "BackUtilTestUserPassword"
+        self.db_name = "BackupDB"
+        self._create_user_and_db()
+        #instance_info.dbaas.instances.resize_instance(instance_info.id, 4)
+        #inst_status = instance_info.dbaas.instances.get(instance_info.id).status
+        #print("perf (618: %r" % inst_status)
+        #poll_until(lambda: self._verify_instance_status(instance_info.id,
+        #                                                'ACTIVE'),
+        #           time_out=180, sleep_time=2)
+
+    def create_connection(self):
+        conn = mysql_connection().create(self.info.get_address(),
+                                           self.user, self.password)
+        if isinstance(conn, old_util.SqlAlchemyConnection):
+            def sql_execute_no_result(cmd, is_query=True):
+                cmd = cmd.replace("%", "%%")
+                try:
+                    conn.conn.execute(cmd)
+                    return []
+                except:
+                    conn.trans.rollback()
+                    conn.trans = None
+                    try:
+                        raise
+                    except old_util.ResourceClosedError as re:
+                        conn.trans = self.conn.begin()
+                        return []
+
+            # Monkey patch this function.
+            conn.execute = sql_execute_no_result
+        return conn
+
+    def _create_user_and_db(self):
+        databases = [
+            {"name": self.db_name}
+        ]
+        users = [{
+            "name": self.user,
+            "password": self.password,
+            "databases": databases
+        }]
+        # Assume these will only fail if the user or database already exists.
+        try:
+            self.info.dbaas.users.create(self.info.id, users)
+        except:
+            pass
+        try:
+            self.info.dbaas.databases.create(self.info.id, databases)
+        except:
+            pass
+
+    #def create_phat_table(self, size_in_kb, full_is_ok):
+    @test
+    def create_phat_table(self):
+        with self.create_connection() as db:
+            db.execute("use %s" % self.db_name)
+            db.execute("DROP PROCEDURE IF EXISTS stuff_it")
+            db.execute("DROP PROCEDURE IF EXISTS size_of_db")
+            db.execute("""
+                DELIMITER //
+                CREATE PROCEDURE stuff_it (IN finish INT)
+                BEGIN
+                    DROP TABLE IF EXISTS Stuff;
+                    CREATE TABLE IF NOT EXISTS Stuff (
+                        id INT NOT NULL AUTO_INCREMENT,
+                        junk CHAR(252) NOT NULL,
+                        junk2 CHAR(252) NOT NULL,
+                        junk3 CHAR(252) NOT NULL,
+                        junk4 CHAR(252) NOT NULL,
+                        PRIMARY KEY(id));
+                    DELETE FROM Stuff;
+                    SET @i = 0;
+                    REPEAT
+                        SET @i = @i + 1;
+                        INSERT INTO Stuff (id, junk, junk2, junk3, junk4)
+                            VALUES(@i, @i, @i, @i, @i);
+                    UNTIL @i >= finish END REPEAT;
+                END //
+                CREATE PROCEDURE size_of_db ()
+                BEGIN
+                    SELECT TABLE_SCHEMA AS 'Database', TABLE_NAME AS 'Table',
+                    CONCAT(ROUND(((DATA_LENGTH + INDEX_LENGTH - DATA_FREE) /
+                    1024 / 1024),2)," MB") AS Size
+                    FROM INFORMATION_SCHEMA.TABLES
+                    where TABLE_SCHEMA like 'BackupDB';
+                END //
+                DELIMITER ;
+                """)
+            try:
+                db.execute("""CALL stuff_it(%d)""" % (10000))
+            except Exception as ex:
+                if "The table 'Stuff' is full" in str(ex):
+                    return
+                raise
+
+            # THIS is where I think the problem is, we're sending the execute
+            # command to create Table Stuff2 but the previous command has not
+            # completed the stuff_it call on 10000 rows
+
+            db.execute("""CREATE TABLE Stuff2 LIKE Stuff;""")
+
+
+            print("Completed stuffing, run CALL size_of_db();")
+            db.execute("""show tables;
+                          CALL size_of_db();
+                          CREATE TABLE Stuff2 LIKE Stuff;
+                          INSERT Stuff2 SELECT * FROM Stuff;""")
+            db.execute("""show tables;""")
+            print("Completed stuffingx2")
+            db.execute("""CALL size_of_db();""")
+
+        sleep(10)
+
+        # CREATE BACKUP
+        backup = self._create_backup("fast_backup",
+                                     "fast_backup description",
+                                     inst_id=instance_info.id)
+        assert_equal(202, instance_info.dbaas.last_http_code)
+        poll_until(lambda: self._verify_backup_status(backup.id, 'COMPLETED'),
+                   time_out=120, sleep_time=2)
+        poll_until(lambda: self._verify_instance_status(instance_info.id,
+                                                        'ACTIVE'),
+                   time_out=120, sleep_time=2)
+
+        # CREATE RESTORE
+        restore_resp = self._create_restore(instance_info.dbaas,
+                                            backup.id)
+        assert_equal(200, instance_info.dbaas.last_http_code)
+        assert_equal("BUILD", restore_resp.status)
+        assert_is_not_none(restore_resp.id, 'restored inst_id does not exist')
+        self.restore_id = restore_resp.id
+        poll_until(lambda: self._verify_instance_status(restore_resp.id,
+                                                        'ACTIVE'),
+                   time_out=120, sleep_time=2)
+        restored_inst = instance_info.dbaas.instances.get(restore_resp.id)
+        print(dir(restored_inst))
+        print("Restore ID: %r " % restored_inst.id)
+        self._verify_databases(self.db_name)
+
+        mgmt_restore = instance_info.dbaas_admin.management.show(restore_resp.id)
+        #print(dir(mgmt_restore.server))
+        #print(mgmt_restore.server['addresses']['usernet'][0]['addr'])
+        self.address = mgmt_restore.server['addresses']['usernet'][0]['addr']
+        self.user = "BackUtilTestUser"
+        self.password = "BackUtilTestUserPassword"
+        self.db_name = "BackupDB"
+
+        print("mysql --host %r -u %r -p%r " % (str(self.address), self.user,
+              self.password))
+
+            #db.execute("""DROP PROCEDURE IF EXISTS stuff_it""")
+        #with self.create_connection() as db:
+        #    db.execute("use %s" % self.db_name)
+        #    db.execute("""DELETE FROM Stuff""")
+        '''size_in_kb = 512
+        full_is_ok = True
+        max = size_in_kb * 4
+        step = 5000
+        for i in xrange(0, max, step):
+            with self.create_connection() as db:
+                db.execute("use %s" % self.db_name)
+                end = i + step - 1
+                if max < i:
+                    i = max
+                try:
+                    db.execute("""CALL stuff_it(%d)""" % (i, end))
+                except Exception as ex:
+                    if "The table 'Stuff' is full" in str(ex) and full_is_ok:
+                        return
+                    raise
+        '''

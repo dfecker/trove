@@ -101,7 +101,7 @@ class InstanceTestInfo(object):
 
     def get_address(self):
         result = self.dbaas_admin.mgmt.instances.show(self.id)
-        return result.ip[0]
+        return result.server['addresses']['usernet'][0]['addr']
 
     def get_local_id(self):
         mgmt_instance = self.dbaas_admin.management.show(self.id)

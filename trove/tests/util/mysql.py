@@ -109,7 +109,7 @@ class PexpectMySqlConnection(object):
         cmd = '%s %s' % (tests.SSH_CMD, ssh_args)
         self.proc = pexpect.spawn(cmd)
         print(cmd)
-        self.proc.expect(":~\$", timeout=self.TIME_OUT)
+        self.proc.expect("$", timeout=self.TIME_OUT)
         cmd2 = "mysql --host '%s' -u '%s' '-p%s'\n" % \
                (self.host, self.user, self.password)
         print(cmd2)
@@ -131,7 +131,7 @@ class PexpectMySqlConnection(object):
         self.proc.close()
 
     def execute(self, cmd):
-        self.proc.send(cmd + "\G\n")
+        self.proc.send(cmd + " \G\n")
         outcome = self.proc.expect(['Empty set', 'mysql>'],
                                    timeout=self.TIME_OUT)
         if outcome == 0:
