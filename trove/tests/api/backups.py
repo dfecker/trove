@@ -181,6 +181,47 @@ class BackupsBase(object):
         for db in instance_info.databases:
             assert_true(db_name in dbs)
 
+    def create_connection(self):
+        conn = mysql_connection().create(instance_info.get_address(),
+                                           self.user, self.password)
+        if isinstance(conn, old_util.SqlAlchemyConnection):
+            def sql_execute_no_result(cmd, is_query=True):
+                cmd = cmd.replace("%", "%%")
+                try:
+                    conn.conn.execute(cmd)
+                    return []
+                except:
+                    conn.trans.rollback()
+                    conn.trans = None
+                    try:
+                        raise
+                    except old_util.ResourceClosedError as re:
+                        conn.trans = self.conn.begin()
+                        return []
+
+            # Monkey patch this function.
+            conn.execute = sql_execute_no_result
+        return conn
+
+    def _create_user_and_db(self):
+        databases = [
+            {"name": self.db_name}
+        ]
+        users = [{
+            "name": self.user,
+            "password": self.password,
+            "databases": databases
+        }]
+        # Assume these will only fail if the user or database already exists.
+        try:
+            instance_info.dbaas.users.create(instance_info.id, users)
+        except:
+            pass
+        try:
+            instance_info.dbaas.databases.create(instance_info.id, databases)
+        except:
+            pass
+
 
 @test(depends_on_classes=[WaitForGuestInstallationToFinish],
       groups=[GROUP, GROUP_POSITIVE])
@@ -408,7 +449,7 @@ class TestBackupNegative(BackupsBase):
 
     @test
     def test_list_backups_account_not_owned(self):
-        raise SkipTest("Please see Launchpad Bug #1188822")
+        #raise SkipTest("Please see Launchpad Bug #1188822")
         std_backup = instance_info.dbaas.backups.list()[0]
         try:
             self.spare_client.backups.get(std_backup)
@@ -436,7 +477,7 @@ class TestBackupNegative(BackupsBase):
 
     @test
     def test_delete_backup_account_not_owned(self):
-        raise SkipTest("Please see Launchpad Bug #1188822")
+        #raise SkipTest("Please see Launchpad Bug #1188822")
         std_backup = instance_info.dbaas.backups.list()[0]
         print("SPARE USER: %r STD BACKUP: %r" %
               (self.spare_user.auth_user,
@@ -592,15 +633,6 @@ class TestBackupCleanup(BackupsBase):
                     assert_equal(404, instance_info.dbaas.last_http_code)
 
 
-class TestMySqlConnection(MySqlConnection):
-
-    def create(self, ip, user_name, password):
-        from reddwarf.tests.util import mysql
-        connection = CONFIG.mysql_connection_method
-
-        return mysql.create_mysql_connection(ip, user_name, password)
-
-
 @test(groups=[GROUP_DELETE])
 class TestDeleteAll(BackupsBase):
 
@@ -620,70 +652,19 @@ class TestDeleteAll(BackupsBase):
 
 @test(depends_on_classes=[WaitForGuestInstallationToFinish],
       groups=[GROUP, GROUP_PERFORMANCE])
-class MySqlUtil(BackupsBase):
+class TestBackupPerformance(BackupsBase):
+    user = "BackUtilTestUser"
+    password = "BackUtilTestUserPassword"
+    db_name = "BackupDB"
+    TIME_OUT = 30
 
     def __init__(self):
-        self.info = instance_info
-        inst = instance_info.dbaas.instances.get(instance_info.id)
         mgmt_inst = instance_info.dbaas_admin.management.show(instance_info)
-        #print(dir(mgmt_inst.server))
-        #print(mgmt_inst.server['addresses']['usernet'][0]['addr'])
         self.address = mgmt_inst.server['addresses']['usernet'][0]['addr']
-        self.user = "BackUtilTestUser"
-        self.password = "BackUtilTestUserPassword"
-        self.db_name = "BackupDB"
         self._create_user_and_db()
-        #instance_info.dbaas.instances.resize_instance(instance_info.id, 4)
-        #inst_status = instance_info.dbaas.instances.get(instance_info.id).status
-        #print("perf (618: %r" % inst_status)
-        #poll_until(lambda: self._verify_instance_status(instance_info.id,
-        #                                                'ACTIVE'),
-        #           time_out=180, sleep_time=2)
 
-    def create_connection(self):
-        conn = mysql_connection().create(self.info.get_address(),
-                                           self.user, self.password)
-        if isinstance(conn, old_util.SqlAlchemyConnection):
-            def sql_execute_no_result(cmd, is_query=True):
-                cmd = cmd.replace("%", "%%")
-                try:
-                    conn.conn.execute(cmd)
-                    return []
-                except:
-                    conn.trans.rollback()
-                    conn.trans = None
-                    try:
-                        raise
-                    except old_util.ResourceClosedError as re:
-                        conn.trans = self.conn.begin()
-                        return []
-
-            # Monkey patch this function.
-            conn.execute = sql_execute_no_result
-        return conn
-
-    def _create_user_and_db(self):
-        databases = [
-            {"name": self.db_name}
-        ]
-        users = [{
-            "name": self.user,
-            "password": self.password,
-            "databases": databases
-        }]
-        # Assume these will only fail if the user or database already exists.
-        try:
-            self.info.dbaas.users.create(self.info.id, users)
-        except:
-            pass
-        try:
-            self.info.dbaas.databases.create(self.info.id, databases)
-        except:
-            pass
-
-    #def create_phat_table(self, size_in_kb, full_is_ok):
     @test
-    def create_phat_table(self):
+    def populate_DB_tables(self):
         with self.create_connection() as db:
             db.execute("use %s" % self.db_name)
             db.execute("DROP PROCEDURE IF EXISTS stuff_it")
@@ -719,7 +700,7 @@ class MySqlUtil(BackupsBase):
                 DELIMITER ;
                 """)
             try:
-                db.execute("""CALL stuff_it(%d)""" % (10000))
+                db.execute("""CALL stuff_it(%d) ;""" % (10000))
             except Exception as ex:
                 if "The table 'Stuff' is full" in str(ex):
                     return
@@ -743,10 +724,13 @@ class MySqlUtil(BackupsBase):
 
         sleep(10)
 
+    @test(depends_on=[populate_DB_tables])
+    def test_backup_loaded_DB(self):
         # CREATE BACKUP
         backup = self._create_backup("fast_backup",
                                      "fast_backup description",
                                      inst_id=instance_info.id)
+        self.backup_id = backup.id
         assert_equal(202, instance_info.dbaas.last_http_code)
         poll_until(lambda: self._verify_backup_status(backup.id, 'COMPLETED'),
                    time_out=120, sleep_time=2)
@@ -754,9 +738,11 @@ class MySqlUtil(BackupsBase):
                                                         'ACTIVE'),
                    time_out=120, sleep_time=2)
 
+    @test(depends_on=[test_backup_loaded_DB])
+    def test_restore_loaded_DB(self):
         # CREATE RESTORE
         restore_resp = self._create_restore(instance_info.dbaas,
-                                            backup.id)
+                                            self.backup_id)
         assert_equal(200, instance_info.dbaas.last_http_code)
         assert_equal("BUILD", restore_resp.status)
         assert_is_not_none(restore_resp.id, 'restored inst_id does not exist')
@@ -768,36 +754,7 @@ class MySqlUtil(BackupsBase):
         print(dir(restored_inst))
         print("Restore ID: %r " % restored_inst.id)
         self._verify_databases(self.db_name)
-
         mgmt_restore = instance_info.dbaas_admin.management.show(restore_resp.id)
-        #print(dir(mgmt_restore.server))
-        #print(mgmt_restore.server['addresses']['usernet'][0]['addr'])
         self.address = mgmt_restore.server['addresses']['usernet'][0]['addr']
-        self.user = "BackUtilTestUser"
-        self.password = "BackUtilTestUserPassword"
-        self.db_name = "BackupDB"
-
         print("mysql --host %r -u %r -p%r " % (str(self.address), self.user,
               self.password))
-
-            #db.execute("""DROP PROCEDURE IF EXISTS stuff_it""")
-        #with self.create_connection() as db:
-        #    db.execute("use %s" % self.db_name)
-        #    db.execute("""DELETE FROM Stuff""")
-        '''size_in_kb = 512
-        full_is_ok = True
-        max = size_in_kb * 4
-        step = 5000
-        for i in xrange(0, max, step):
-            with self.create_connection() as db:
-                db.execute("use %s" % self.db_name)
-                end = i + step - 1
-                if max < i:
-                    i = max
-                try:
-                    db.execute("""CALL stuff_it(%d)""" % (i, end))
-                except Exception as ex:
-                    if "The table 'Stuff' is full" in str(ex) and full_is_ok:
-                        return
-                    raise
-        '''
